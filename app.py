@@ -1,203 +1,390 @@
 # =========================================================
-# 📈 STOCK PROJECTION SIMULATOR v3.1
-# (Initial + Recurring Investments + Dividends + Growth + Monte Carlo + Charts)
+# 📈 STOCK PROJECTION SIMULATOR — Streamlit Dashboard (v4)
+# Converts your v3.1 console app into a SaaS-style UI
 # =========================================================
-
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
-import numpy as np, pandas as pd, yfinance as yf, matplotlib.pyplot as plt
-from datetime import datetime, timedelta
-plt.style.use('seaborn-v0_8-darkgrid')
 
-# ---------- Helpers ----------
+import streamlit as st
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+
+st.set_page_config(page_title="Stock Projection Simulator", layout="wide")
+plt.style.use("seaborn-v0_8-darkgrid")
+
+# ---------------------- Helpers ----------------------
+@st.cache_data(show_spinner=False)
+def validate_ticker(t: str) -> bool:
+    try:
+        df = yf.download(t, period="1d", progress=False)
+        return not df.empty
+    except Exception:
+        return False
+
+@st.cache_data(show_spinner=False)
+def load_px(ticker: str, period="5y") -> pd.Series:
+    """Fetch a single price series robustly (Adj Close → Close → first numeric col)."""
+    df = yf.download(ticker, period=period, progress=False)
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+
+    # MultiIndex columns (rare with single ticker but handle anyway)
+    if isinstance(df.columns, pd.MultiIndex):
+        for col in [("Adj Close", ticker), ("Close", ticker)]:
+            if col in df.columns:
+                return df[col].dropna()
+        s = df.select_dtypes(include="number").iloc[:, 0].dropna()
+        return s
+
+    for col in ["Adj Close", "Close"]:
+        if col in df.columns:
+            return df[col].dropna()
+
+    s = df.select_dtypes(include="number")
+    return s.iloc[:, 0].dropna() if not s.empty else pd.Series(dtype=float)
+
 def money(num):
-    if num is None or pd.isna(num): return "N/A"
-    mag, n = 0, float(num)
-    while abs(n) >= 1000 and mag < 5: mag += 1; n /= 1000
-    return f"${n:,.2f}{['','K','M','B','T'][mag]}"
+    try:
+        return f"${float(num):,.2f}"
+    except Exception:
+        return "N/A"
 
-def validate_ticker(t):
-    try: return not yf.download(t, period="1d", progress=False).empty
-    except: return False
+def get_price(stock: yf.Ticker, fallback_last=None):
+    try:
+        p = stock.fast_info.get("last_price") or stock.info.get("regularMarketPrice")
+        if p:
+            return float(p)
+    except Exception:
+        pass
+    try:
+        h = stock.history(period="5d")["Close"].dropna()
+        if len(h):
+            return float(h.iloc[-1])
+    except Exception:
+        pass
+    return float(fallback_last) if fallback_last is not None else None
 
-def ask_yes_no(prompt):
-    while True:
-        a = input(prompt).strip().lower()
-        if a in ["yes","no"]: return a=="yes"
-        print("Please answer only 'yes' or 'no'.")
-
-def get_price(stock):
-    try: return float(stock.fast_info.get("last_price") or stock.info.get("regularMarketPrice"))
-    except: 
-        try:
-            h = stock.history(period="5d")["Close"].dropna()
-            return float(h.iloc[-1]) if len(h) else None
-        except: return None
-
-def div_ttm(stock, price):
+def div_ttm(stock: yf.Ticker, current_price: float):
+    """Return (TTM dividend/share, TTM yield)."""
     try:
         div = stock.dividends
-        if div is None or div.empty or not price: return 0,0
-        if getattr(div.index,"tz",None): div.index = div.index.tz_localize(None)
-        cutoff = pd.Timestamp.today().normalize()-pd.Timedelta(days=365)
-        ttm = float(div[div.index>=cutoff].sum())
-        return ttm, ttm/price if price>0 else 0
-    except: return 0,0
+        if div is None or div.empty or not current_price:
+            return 0.0, 0.0
+        if getattr(div.index, "tz", None) is not None:
+            div.index = div.index.tz_localize(None)
+        cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=365)
+        ttm = float(div[div.index >= cutoff].sum())
+        yld = ttm / current_price if current_price > 0 else 0.0
+        return ttm, yld
+    except Exception:
+        return 0.0, 0.0
 
-# ---------- Fundamentals ----------
-def fundamentals(ticker, invest=None):
-    s = yf.Ticker(ticker)
-    p = get_price(s)
-    dps, dy = div_ttm(s, p)
-    try: info=s.info
-    except: info={}
-    print(f"\n📊 Key Fundamentals for {ticker}")
-    print(f"Current Price: ${p:,.2f}")
-    print(f"Market Cap: {money(info.get('marketCap'))}")
-    print(f"Shares Outstanding: {money(info.get('sharesOutstanding'))}")
-    print(f"Trailing P/E: {info.get('trailingPE','N/A')}")
-    print(f"Dividend/Share (TTM): ${dps:.2f}")
-    print(f"Dividend Yield (TTM): {dy*100:.2f}%")
-    if invest and p:
-        est = invest*dy
-        print(f"\n💵 Estimated Annual Dividends: ${est:,.2f} (from {dy*100:.2f}% yield, ${dps:,.2f}/sh)")
-    return p, dps, dy
+# ---------------------- Sidebar (Dashboard Inputs) ----------------------
+st.title("📈 Stock Projection Simulator")
+st.caption("Estimate long-term portfolio performance with dividends, recurring investments, and Monte Carlo scenarios.")
 
-# ---------- Prices ----------
-def load_px(t, period="5y"):
-    d=yf.download(t,period=period,progress=False)
-    if "Adj Close" in d.columns: return d["Adj Close"].dropna()
-    if "Close" in d.columns: return d["Close"].dropna()
-    return d.select_dtypes(include='number').iloc[:,0].dropna()
+with st.sidebar:
+    st.header("Inputs")
+    ticker = st.text_input("Ticker (e.g. AAPL, MSFT, SPY)", "AAPL").upper().strip()
 
-# =========================================================
-# MAIN LOOP
-# =========================================================
-while True:
-    TICKER=input("Enter stock ticker (e.g. AAPL, MSFT): ").strip().upper()
-    if not validate_ticker(TICKER): print("❌ Invalid ticker."); continue
+    c1, c2 = st.columns(2)
+    with c1:
+        initial_invest = st.number_input("Initial Investment ($)", min_value=0.0, value=1000.0, step=100.0)
+    with c2:
+        months = st.slider("Horizon (months)", 1, 120, 36)
 
-    INVEST=float(input("Initial investment amount (USD): "))
-    RECUR=False; RECUR_AMT=0; DCA_FREQ_DAYS=30; DCA_MONTHS=0; DCA_COUNT=0
-    RECUR=ask_yes_no("Will there be recurring investments (DCA)? (yes/no): ")
-    if RECUR:
-        RECUR_AMT=float(input("How much (USD) per recurring investment? "))
-        print("Frequency: 1=Weekly, 2=Biweekly, 3=Monthly")
-        ch=int(input("Select (1/2/3): "))
-        DCA_FREQ_DAYS=7 if ch==1 else 14 if ch==2 else 30
-        DCA_MONTHS=int(input("For how many months? "))
-        DCA_COUNT=int(DCA_MONTHS*30.4375//DCA_FREQ_DAYS)
-        print(f"📆 You will invest ${RECUR_AMT:,.2f} every {DCA_FREQ_DAYS} days for {DCA_MONTHS} months (~{DCA_COUNT} contributions).")
+    recurring = st.checkbox("Enable recurring investments (DCA)?", value=True)
+    if recurring:
+        recur_amt = st.number_input("Recurring amount ($)", min_value=0.0, value=200.0, step=50.0)
+        freq = st.selectbox("Frequency", ["Monthly", "Biweekly", "Weekly"])
     else:
-        DCA_MONTHS=int(input("Hold period (months)? "))
+        recur_amt = 0.0
+        freq = "Monthly"
 
-    price,dps,dy=fundamentals(TICKER,INVEST)
+    # Dividend settings (from v3.1)
+    st.divider()
+    st.subheader("Dividends")
+    div_growth_pct = st.number_input("Annual dividend growth (%)", value=0.0, step=0.5, min_value=0.0)
+    reinvest = st.checkbox("Reinvest dividends into shares", value=True)
+
+    # Scenario drift multipliers (your v3.1 used 0.5/1.0/1.5; adjustable here)
+    st.divider()
+    st.subheader("Scenario Drift Multipliers")
+    bear_mult    = st.slider("🐻 Bearish", 0.25, 1.50, 0.50, 0.05)
+    neutral_mult = 1.00
+    bull_mult    = st.slider("🚀 Bullish", 1.00, 1.75, 1.50, 0.05)
+
+    # Monte Carlo paths
+    N_PATHS = st.selectbox("Monte Carlo paths", [500, 1000, 2000], index=1)
+
+    run = st.button("🚀 Run Simulation", use_container_width=True)
+
+# ---------------------- Run ----------------------
+if run:
+    if not ticker or not validate_ticker(ticker):
+        st.error("❌ Invalid or empty ticker. Please enter a valid symbol.")
+        st.stop()
+
+    # Load price data
+    px = load_px(ticker, "5y")
+    if px is None or px.empty:
+        st.error("No price data found for that ticker.")
+        st.stop()
+
+    # Fundamentals
+    tkr = yf.Ticker(ticker)
+    last_hist_price = float(px.iloc[-1])
+    current_price = get_price(tkr, fallback_last=last_hist_price) or last_hist_price
+    dps_ttm, yld_ttm = div_ttm(tkr, current_price)
+
+    # Show a fundamentals snapshot (like your prints)
+    f1, f2, f3, f4 = st.columns(4)
+    f1.metric("Current Price", money(current_price))
     try:
-        DIV_GROWTH=float(input("Expected annual dividend growth rate (%): ") or 0)/100
-        print(f"📈 Dividend growth set to {DIV_GROWTH*100:.2f}% annually.")
-    except: DIV_GROWTH=0; print("⚠️ Invalid. Using 0%.")
-    REINV=dy>0 and ask_yes_no("Reinvest dividends? (yes/no): ")
+        info = tkr.info
+    except Exception:
+        info = {}
+    mcap = info.get("marketCap")
+    shares_out = info.get("sharesOutstanding")
+    pe = info.get("trailingPE")
 
-    hold_months=DCA_MONTHS
-    FWD_DAYS=int(hold_months*21); N=1000
-    px=load_px(TICKER,"5y"); rets=np.log(px/px.shift(1)).dropna()
-    mu,sig=float(rets.mean()),float(rets.std()); last=price or float(px.iloc[-1])
-    dt=1/252; randn=np.random.normal(size=(FWD_DAYS,N))
-    scen={"🐻 Bearish":0.5,"😐 Neutral":1.0,"🚀 Bullish":1.5}; res={}
-    for lab,m in scen.items():
-        mu_a=mu*m+(dy/252 if REINV else 0)
-        drift=(mu_a-0.5*sig**2)*dt; shock=sig*np.sqrt(dt)*randn
-        path=np.zeros((FWD_DAYS,N)); path[0,:]=last
-        for t in range(1,FWD_DAYS): path[t]=path[t-1]*np.exp(drift+shock[t])
-        res[lab]={"p10":np.percentile(path,10,axis=1),
-                  "p50":np.percentile(path,50,axis=1),
-                  "p90":np.percentile(path,90,axis=1)}
-    proj_idx=pd.date_range(px.index[-1]+pd.Timedelta(days=1),periods=FWD_DAYS,freq="B")
+    f2.metric("Market Cap", money(mcap))
+    f3.metric("Shares Outstanding", f"{shares_out:,.0f}" if shares_out else "N/A")
+    f4.metric("Trailing P/E", f"{pe:.2f}" if pe else "N/A")
 
-    # Quick preview
+    g1, g2, g3, g4 = st.columns(4)
+    g1.metric("Dividend/Share (TTM)", money(dps_ttm))
+    g2.metric("Dividend Yield (TTM)", f"{yld_ttm*100:.2f}%")
+    g3.metric("52W High", money(info.get("fiftyTwoWeekHigh")))
+    g4.metric("52W Low", money(info.get("fiftyTwoWeekLow")))
+
+    # Estimated annual dividends on initial only (mirrors your v3.1 print)
+    if current_price and yld_ttm is not None:
+        est_init_div = initial_invest * yld_ttm
+        st.info(f"💵 **Estimated Annual Dividends (on initial):** {money(est_init_div)} "
+                f"(from {yld_ttm*100:.2f}% yield, {money(dps_ttm)}/sh)")
+
+    # Returns stats from 5y series (v3.1)
+    rets = np.log(px / px.shift(1)).dropna()
+    mu_d, sig_d = float(rets.mean()), float(rets.std())
+
+    # DCA math
+    freq_days = 30 if freq == "Monthly" else 14 if freq == "Biweekly" else 7
+    dca_count = int((months * 30.4375) // freq_days) if recurring else 0
+    total_contrib = initial_invest + (recur_amt * dca_count)
+
+    st.info(
+        f"💵 **Total planned contributions:** {money(total_contrib)} "
+        f"({money(initial_invest)} initial + {dca_count} × {money(recur_amt)})"
+    )
+
+    # ---------------- Quick Preview (your v3.1 drift preview) ----------------
+    st.subheader(f"⏳ Quick Drift Preview ({months}-month estimate)")
     try:
-        print("\n⏳ Calculating projected portfolio value scenarios...\n")
-        px1=load_px(TICKER,"1y"); r=np.log(px1/px1.shift(1)).dropna()
-        mu_p=float(r.mean()); last1=price or float(px1.iloc[-1]); days=int(hold_months*21)
-        scen_p={"🐻 Bearish (-50% drift)":0.5,"😐 Neutral (baseline)":1.0,"🚀 Bullish (+50% drift)":1.5}
-        print(f"💼 Portfolio Value Projections ({hold_months}-month estimate)")
-        print("─"*60)
-        for lab,m in scen_p.items():
-            proj=last1*np.exp(mu_p*m*days)
-            contrib=INVEST+(RECUR_AMT*DCA_COUNT if RECUR else 0)
-            val=contrib*(proj/last1); ret=(val/contrib-1)*100
-            print(f"{lab:<28} ${proj:>12,.2f}   Value: ${val:>10,.2f} ({ret:>+5.1f}%)")
-        print("─"*60)
-    except Exception as e: print(f"⚠️ Preview failed: {e}")
+        px1 = load_px(ticker, "1y")
+        r = np.log(px1 / px1.shift(1)).dropna()
+        mu_p = float(r.mean())
+        last1 = current_price or float(px1.iloc[-1])
+        days = int(months * 21)
+        scen_p = {
+            "🐻 Bearish (−50% drift)": 0.5,
+            "😐 Neutral (baseline)": 1.0,
+            "🚀 Bullish (+50% drift)": 1.5
+        }
+        rows_prev = []
+        for lab, m in scen_p.items():
+            proj = last1 * np.exp(mu_p * m * days)
+            val = total_contrib * (proj / last1)
+            ret = (val / total_contrib - 1) * 100 if total_contrib > 0 else 0.0
+            rows_prev.append([lab, money(proj), money(val), f"{ret:+.1f}%"])
+        st.dataframe(pd.DataFrame(rows_prev, columns=["Scenario", "Proj. Price", "Value", "Return"]),
+                     use_container_width=True)
+    except Exception as e:
+        st.warning(f"Preview failed: {e}")
 
-    # Monte Carlo result summary
-    total_contrib=INVEST+(RECUR_AMT*DCA_COUNT if RECUR else 0)
-    print("\n💼 Projected Portfolio Value Using Monte Carlo Scenarios:")
-    print("─────────────────────────────────────────────────────")
-    print(f"{'Scenario':<15} {'Proj. Price':>15} {'Portfolio Value':>20} {'Return':>10}")
-    print("─────────────────────────────────────────────────────")
-    for lab in scen.keys():
-        proj=res[lab]["p50"][-1]
-        val=total_contrib*(proj/last); ret=(val/total_contrib-1)*100
-        print(f"{lab:<15} ${proj:>13,.2f} ${val:>18,.2f} {ret:>9.1f}%")
-    print("─────────────────────────────────────────────────────")
+    # ---------------- Monte Carlo (v3.1) ----------------
+    FWD_DAYS = int(months * 21)
+    dt = 1 / 252
+    randn = np.random.normal(size=(FWD_DAYS, int(N_PATHS)))
 
-    # Dividend cashflow
-    neutral=pd.Series(res["😐 Neutral"]["p50"],index=proj_idx).asfreq("D").interpolate()
-    s_cf=yf.Ticker(TICKER); divh=s_cf.dividends
-    if divh is not None and not divh.empty and getattr(divh.index,"tz",None): divh.index=divh.index.tz_localize(None)
-    last_div=float(divh.iloc[-1]) if (divh is not None and not divh.empty) else (dps/4 if dps>0 else 0)
-    today=pd.Timestamp.today().normalize(); end=today+pd.Timedelta(days=int(hold_months*30.4375))
-    next=today+pd.Timedelta(days=90); pays=[]
-    while next<=end: pays.append(next); next+=pd.Timedelta(days=90)
-    if RECUR:
-        buys=pd.date_range(start=today+pd.Timedelta(days=1),periods=DCA_COUNT,freq=f"{DCA_FREQ_DAYS}D")
-        buy_px=neutral.reindex(buys,method="nearest"); shares=(RECUR_AMT/buy_px).astype(float)
-        shares.loc[today]=INVEST/last
+    scen = {"🐻 Bearish": bear_mult, "😐 Neutral": 1.0, "🚀 Bullish": bull_mult}
+    res = {}
+    for lab, m in scen.items():
+        mu_a = mu_d * m + (yld_ttm / 252 if reinvest else 0.0)
+        drift = (mu_a - 0.5 * sig_d ** 2) * dt
+        shock = sig_d * np.sqrt(dt) * randn
+        path = np.zeros((FWD_DAYS, int(N_PATHS)))
+        path[0, :] = current_price
+        for t in range(1, FWD_DAYS):
+            path[t] = path[t - 1] * np.exp(drift + shock[t])
+        res[lab] = {
+            "p10": np.percentile(path, 10, axis=1),
+            "p50": np.percentile(path, 50, axis=1),
+            "p90": np.percentile(path, 90, axis=1),
+        }
+
+    proj_idx = pd.date_range(px.index[-1] + pd.Timedelta(days=1), periods=FWD_DAYS, freq="B")
+
+    # Scenario summary table (v3.1 semantics)
+    st.subheader("💼 Projected Portfolio Value Using Monte Carlo (Median)")
+    rows_mc = []
+    for lab in ["🐻 Bearish", "😐 Neutral", "🚀 Bullish"]:
+        proj_price = float(res[lab]["p50"][-1])
+        value = total_contrib * (proj_price / current_price) if current_price > 0 else 0.0
+        ret = (value / total_contrib - 1) * 100 if total_contrib > 0 else 0.0
+        rows_mc.append([lab, money(proj_price), money(value), f"{ret:.1f}%"])
+    st.dataframe(pd.DataFrame(rows_mc, columns=["Scenario", "Projected Price", "Portfolio Value", "Return"]),
+                 use_container_width=True)
+
+    # ---------------- Dividend Cashflow (quarterly, with growth) ----------------
+    st.subheader("🗓️ Expected Dividend Cashflow Schedule")
+    # Build neutral median price to time DCA purchases
+    neutral_series = pd.Series(res["😐 Neutral"]["p50"], index=proj_idx).asfreq("D").interpolate()
+
+    today = pd.Timestamp.today().normalize()
+    end_cf = today + pd.Timedelta(days=int(months * 30.4375))
+    pay_dates = []
+    nxt = today + pd.Timedelta(days=90)
+    while nxt <= end_cf:
+        pay_dates.append(nxt)
+        nxt += pd.Timedelta(days=90)
+
+    # Shares schedule
+    if recurring and dca_count > 0:
+        buy_dates = pd.date_range(start=today + pd.Timedelta(days=1), periods=dca_count, freq=f"{freq_days}D")
+        buy_px = neutral_series.reindex(buy_dates, method="nearest")
+        shares = (recur_amt / buy_px).astype(float)
+        # Add initial "buy" today at current price
+        init_units = (initial_invest / current_price) if current_price > 0 else 0.0
+        shares.loc[today] = init_units
     else:
-        buys=[today]; shares=pd.Series([INVEST/last],index=buys)
+        init_units = (initial_invest / current_price) if current_price > 0 else 0.0
+        shares = pd.Series([init_units], index=[today])
 
-    rows=[]; cum=0
-    for i,pdte in enumerate(pays):
-        elig=float(shares[shares.index<=pdte].sum())
-        if elig<=0 or last_div<=0: continue
-        adj=last_div*((1+DIV_GROWTH/4)**i)
-        cash=elig*adj; cum+=cash
-        rows.append({"Payment Date":pdte.date(),"Dividend/Share":f"${adj:.2f}",
-                     "Eligible Shares":f"{elig:,.4f}","Total Payment ($)":f"${cash:,.2f}",
-                     "Cumulative ($)":f"${cum:,.2f}"})
-    if rows:
-        df=pd.DataFrame(rows)
-        print("\n🗓️ Expected Dividend Cashflow Schedule:")
-        print(df.to_string(index=False))
+    # Quarterly dividend/share baseline from TTM
+    last_div_q = (dps_ttm / 4.0) if dps_ttm > 0 else 0.0
+    div_g = div_growth_pct / 100.0
 
-        df["Payment Date"]=pd.to_datetime(df["Payment Date"])
-        df["Total Payment ($)"]=df["Total Payment ($)"].replace('[\$,]','',regex=True).astype(float)
-        q=df.groupby(df["Payment Date"].dt.to_period("Q"))["Total Payment ($)"].sum().reset_index()
-        q["Quarter"]=q["Payment Date"].astype(str)
-        q["Cumulative Dividends ($)"]=q["Total Payment ($)"].cumsum()
-        contrib=[]
-        if RECUR:
-            for qt in q["Quarter"]:
-                qs,qe=pd.Period(qt).start_time,pd.Period(qt).end_time
-                contrib.append(sum((d>=qs)&(d<=qe) for d in buys)*RECUR_AMT)
-        else: contrib=[0]*len(q)
-        contrib[0]+=INVEST
-        q["Contributions ($)"]=contrib; q["Total Contributions ($)"]=np.cumsum(q["Contributions ($)"])
-        q["Yield on Cost (%)"]=q["Cumulative Dividends ($)"]/q["Total Contributions ($)"]*100
-        print("\n📆 Quarterly Dividend + Contribution Summary:")
-        print(q.to_string(index=False))
+    rows_cf, cum_div = [], 0.0
+    for i, pdte in enumerate(pay_dates):
+        elig_shares = float(shares[shares.index <= pdte].sum())
+        if elig_shares <= 0 or last_div_q <= 0:
+            continue
+        adj_div = last_div_q * ((1 + div_g / 4) ** i)
+        cash = elig_shares * adj_div
+        cum_div += cash
+        rows_cf.append({
+            "Payment Date": pdte.date(),
+            "Dividend/Share": money(adj_div),
+            "Eligible Shares": f"{elig_shares:,.4f}",
+            "Total Payment ($)": money(cash),
+            "Cumulative ($)": money(cum_div)
+        })
 
-    # Chart: Monte Carlo
-    plt.figure(figsize=(12,6))
-    plt.plot(px.index,px.values,label="Historical",color="gray")
-    for lab,d in res.items():
-        c={"🐻 Bearish":"red","😐 Neutral":"orange","🚀 Bullish":"green"}[lab]
-        plt.plot(proj_idx,d["p50"],label=f"{lab} Median",color=c)
-        plt.fill_between(proj_idx,d["p10"],d["p90"],alpha=.15,color=c)
-    plt.title(f"{TICKER} Monte Carlo Projection ({FWD_DAYS} trading days)")
-    plt.xlabel("Date"); plt.ylabel("Price (USD)"); plt.legend(); plt.show()
+    if rows_cf:
+        cf_df = pd.DataFrame(rows_cf)
+        st.dataframe(cf_df, use_container_width=True)
 
-    if not ask_yes_no("\nRun another simulation? (yes/no): "):
-        print("👋 Thanks for using the Stock Projection Simulator!")
-        break
+        # Quarterly summary (like v3.1)
+        qdf = cf_df.copy()
+        qdf["Payment Date"] = pd.to_datetime(qdf["Payment Date"])
+        qdf["Total Payment ($)"] = qdf["Total Payment ($)"].replace(r"[\$,]", "", regex=True).astype(float)
+        qsum = qdf.groupby(qdf["Payment Date"].dt.to_period("Q"))["Total Payment ($)"].sum().reset_index()
+        qsum["Quarter"] = qsum["Payment Date"].astype(str)
+        qsum["Cumulative Dividends ($)"] = qsum["Total Payment ($)"].cumsum()
+
+        # Contributions by quarter
+        contrib = []
+        if recurring and dca_count > 0:
+            for qt in qsum["Quarter"]:
+                qs, qe = pd.Period(qt).start_time, pd.Period(qt).end_time
+                count_in_q = 0
+                for d in shares.index:
+                    if d != today and qs <= d <= qe:
+                        count_in_q += 1
+                contrib.append(count_in_q * recur_amt)
+        else:
+            contrib = [0] * len(qsum)
+        if len(contrib) > 0:
+            contrib[0] += initial_invest  # add initial to first quarter
+
+        qsum["Contributions ($)"] = contrib
+        qsum["Total Contributions ($)"] = np.cumsum(qsum["Contributions ($)"])
+        qsum["Yield on Cost (%)"] = np.where(
+            qsum["Total Contributions ($)"] > 0,
+            qsum["Cumulative Dividends ($)"] / qsum["Total Contributions ($)"] * 100,
+            0.0
+        )
+
+        st.subheader("📆 Quarterly Dividend + Contribution Summary")
+        st.dataframe(qsum[[
+            "Quarter", "Total Payment ($)", "Cumulative Dividends ($)",
+            "Contributions ($)", "Total Contributions ($)", "Yield on Cost (%)"
+        ]], use_container_width=True)
+
+        # Chart: Dividends + YOC line
+        fig_cf, ax1 = plt.subplots(figsize=(10, 4))
+        ax2 = ax1.twinx()
+        ax1.bar(qsum["Quarter"], qsum["Total Payment ($)"], label="Dividends ($)")
+        ax2.plot(qsum["Quarter"], qsum["Yield on Cost (%)"], marker="o", label="Yield on Cost (%)")
+        ax1.set_ylabel("Dividends ($)")
+        ax2.set_ylabel("Yield on Cost (%)")
+        ax1.set_title(f"{ticker} — Quarterly Dividends & Yield on Cost")
+        ax1.tick_params(axis='x', rotation=45)
+        ax1.legend(loc="upper left"); ax2.legend(loc="upper right")
+        plt.tight_layout()
+        st.pyplot(fig_cf)
+
+        # CSV download
+        st.download_button(
+            "⬇️ Download dividend cashflow CSV",
+            data=cf_df.to_csv(index=False),
+            file_name=f"{ticker}_dividend_cashflow.csv"
+        )
+
+    # ---------------- Charts ----------------
+    st.subheader("📉 Price Projection (Monte Carlo)")
+    proj_idx = pd.date_range(px.index[-1] + pd.Timedelta(days=1), periods=FWD_DAYS, freq="B")
+    fig_mc, ax = plt.subplots(figsize=(11, 5))
+    ax.plot(px.index, px.values, label="Historical", color="gray")
+    colors = {"🐻 Bearish": "red", "😐 Neutral": "orange", "🚀 Bullish": "green"}
+    for lab, d in res.items():
+        ax.plot(proj_idx, d["p50"], label=f"{lab} Median", color=colors[lab])
+        ax.fill_between(proj_idx, d["p10"], d["p90"], alpha=0.15, color=colors[lab])
+    ax.set_title(f"{ticker} — Monte Carlo Projection ({months} months)")
+    ax.set_xlabel("Date"); ax.set_ylabel("Price (USD)")
+    ax.legend()
+    st.pyplot(fig_mc)
+
+    # Portfolio vs contributions (Neutral scenario)
+    st.subheader("💼 Projected Portfolio vs Contributions (Neutral)")
+    neutral_series = pd.Series(res["😐 Neutral"]["p50"], index=proj_idx).asfreq("D").interpolate()
+
+    contrib_line = pd.Series(0.0, index=neutral_series.index)
+    first_date = neutral_series.index[0]
+    if initial_invest > 0:
+        contrib_line.loc[first_date] += initial_invest
+    if recurring and dca_count > 0:
+        buy_dates = pd.date_range(start=first_date, periods=dca_count, freq=f"{freq_days}D")
+        for d in buy_dates:
+            if d in contrib_line.index:
+                contrib_line.loc[d] += recur_amt
+    cum_contrib = contrib_line.cumsum()
+
+    units = 0.0
+    pv_vals = []
+    for d in neutral_series.index:
+        if contrib_line.loc[d] > 0 and neutral_series.loc[d] > 0:
+            units += contrib_line.loc[d] / neutral_series.loc[d]
+        pv_vals.append(units * neutral_series.loc[d])
+    pv = pd.Series(pv_vals, index=neutral_series.index)
+
+    fig_val, axv = plt.subplots(figsize=(11, 5))
+    axv.plot(pv.index, pv.values, label="Projected Portfolio Value (Neutral)")
+    axv.plot(cum_contrib.index, cum_contrib.values, label="Cumulative Contributions", linestyle="--")
+    axv.set_title(f"{ticker} — Portfolio vs Contributions (Neutral)")
+    axv.set_xlabel("Date"); axv.set_ylabel("USD")
+    axv.legend()
+    st.pyplot(fig_val)
